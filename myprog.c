@@ -4,6 +4,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <sys/wait.h>
 
 #define MAX 257
 
@@ -45,7 +46,15 @@ void captureDirectory(const char *basePath) {
             struct FileMetadata metadata = captureMetadata(path);
             printf("%s\n", metadata.name);
             if (S_ISDIR(metadata.permissions)) {
-                captureDirectory(path);
+                pid_t pid = fork(); 
+                if (pid < 0) {
+                    perror("fork");
+                    exit(EXIT_FAILURE);
+                } else if (pid == 0) {
+                    captureDirectory(path);
+                    exit(EXIT_SUCCESS);
+                }
+
             }
         }
     }
@@ -62,4 +71,8 @@ int main(int argc, char *argv[]) {
     printf("Before monitoring:\n");
     captureDirectory(argv[1]);
 
-   
+
+    while (wait(NULL) > 0);
+
+    return 0;
+}
