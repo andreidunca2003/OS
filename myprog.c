@@ -1,78 +1,136 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <dirent.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <time.h>
+#include <stdbool.h>
 #include <sys/wait.h>
 
-#define MAX 257
+#define MAX_PATH_LENGTH 4096
+#define MAX_FILES 100
 
-struct FileMetadata {
-    char name[256];
-    unsigned int permissions;
-    unsigned long size;
+struct FileDetails {
+    char name[MAX_PATH_LENGTH];
+    time_t modified_time;
+    off_t file_size;
+    mode_t file_permissions;
 };
 
-struct FileMetadata captureMetadata(const char *path) {
-    struct FileMetadata metadata;
-    struct stat st;
+void capture_directory_snapshot(const char *directory_path, struct FileDetails *previous_snapshot, const char *quarantine_directory) {
+    printf("Capturing snapshot for directory: %s\n", directory_path);
 
-    if (stat(path, &st) == 0) {
-        strncpy(metadata.name, path, sizeof(metadata.name));
-        metadata.permissions = st.st_mode & (S_IRWXU | S_IRWXG | S_IRWXO);
-        metadata.size = st.st_size;
-    } else {
-        perror("stat");
+    char snapshot_file_path[MAX_PATH_LENGTH];
+    snprintf(snapshot_file_path, MAX_PATH_LENGTH, "%s/DirectorySnapshot.txt", directory_path);
+
+    int snapshot_file = open(snapshot_file_path, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+    if (snapshot_file == -1) {
+        perror("Error opening snapshot file");
         exit(EXIT_FAILURE);
     }
 
-    return metadata;
-}
+    dprintf(snapshot_file, "Directory snapshot: %s\n", directory_path);
+    dprintf(snapshot_file, "---------------------------------\n");
 
-void captureDirectory(const char *basePath) {
-    char path[MAX];
-    struct dirent *dp;
-    DIR *dir = opendir(basePath);
-
-    if (!dir) {
-        perror("opendir");
+    DIR *directory;
+    struct dirent *file;
+    directory = opendir(directory_path);
+    if (directory == NULL) {
+        perror("Error opening directory");
         exit(EXIT_FAILURE);
     }
 
-    while ((dp = readdir(dir)) != NULL) {
-        if (strcmp(dp->d_name, ".") != 0 && strcmp(dp->d_name, "..") != 0) {
-            sprintf(path, "%s/%s", basePath, dp->d_name);
-            struct FileMetadata metadata = captureMetadata(path);
-            printf("%s\n", metadata.name);
-            if (S_ISDIR(metadata.permissions)) {
-                pid_t pid = fork(); 
-                if (pid < 0) {
-                    perror("fork");
-                    exit(EXIT_FAILURE);
-                } else if (pid == 0) {
-                    captureDirectory(path);
-                    exit(EXIT_SUCCESS);
+    int file_count = 0;
+
+    while ((file = readdir(directory)) != NULL && file_count < MAX_FILES) {
+        if (strcmp(file->d_name, ".") != 0 && strcmp(file->d_name, "..") != 0) {
+            struct stat file_status;
+            char file_path[MAX_PATH_LENGTH];
+            snprintf(file_path, MAX_PATH_LENGTH, "%s/%s", directory_path, file->d_name);
+
+            if (stat(file_path, &file_status) == -1) {
+                perror("Error getting file status");
+                exit(EXIT_FAILURE);
+            }
+
+            if(strcmp(file->d_name, "DirectorySnapshot.txt") == 0) continue;
+            struct FileDetails file_metadata;
+            strcpy(file_metadata.name, file->d_name);
+            file_metadata.modified_time = file_status.st_mtime;
+            file_metadata.file_size = file_status.st_size;
+
+            int pipe_fd[2];
+            pipe(pipe_fd);
+            pid_t child_pid = fork();
+            if(child_pid == -1) {
+                perror("Fork failed");
+                exit(EXIT_FAILURE);
+            } else if(child_pid == 0) {
+                close(pipe_fd[0]);
+                if((S_ISREG(file_status.st_mode) || S_ISDIR(file_status.st_mode)) && stat(file_path, &file_status) != -1 && ((file_status.st_mode & S_IRUSR) || (file_status.st_mode & S_IWUSR) || (file_status.st_mode & S_IXUSR))){
+                    file_metadata.file_permissions = file_status.st_mode;
+                } else {
+                    file_metadata.file_permissions = 0;
                 }
+                write(pipe_fd[1], &file_metadata.file_permissions, sizeof(mode_t));
+                close(pipe_fd[1]);
+                exit(EXIT_SUCCESS);
+            } else {
+                close(pipe_fd[1]);
+                mode_t child_file_permissions;
+                read(pipe_fd[0], &child_file_permissions, sizeof(mode_t));
+                file_metadata.file_permissions = child_file_permissions;
+                close(pipe_fd[0]);
+            }
 
+            if(file_metadata.file_permissions == 0){
+                char quarantine_path[MAX_PATH_LENGTH];
+                snprintf(quarantine_path, MAX_PATH_LENGTH, "%s/%s", quarantine_directory, file->d_name);
+                rename(file_path, quarantine_path);
+            }
+
+            file_count++;
+            dprintf(snapshot_file, "File: %s\n", file_metadata.name);
+            dprintf(snapshot_file, "Size: %lld bytes\n", (long long)file_metadata.file_size);
+            dprintf(snapshot_file, "Permissions: %o\n", file_metadata.file_permissions);
+            dprintf(snapshot_file, "Last Modified: %s", ctime(&file_metadata.modified_time));
+            dprintf(snapshot_file, "\n");
+
+            if (S_ISDIR(file_status.st_mode)) {
+                capture_directory_snapshot(file_path, previous_snapshot, quarantine_directory);
             }
         }
     }
 
-    closedir(dir);
+    closedir(directory);
+    close(snapshot_file);
 }
 
 int main(int argc, char *argv[]) {
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s <directory_path>\n", argv[0]);
+    if (argc < 3 || argc > 12) {
+        printf("Usage: %s -q quarantine_directory directory1 [directory2 ... directory10]\n", argv[0]);
         exit(EXIT_FAILURE);
     }
 
-    printf("Before monitoring:\n");
-    captureDirectory(argv[1]);
+    for (int i = 2; i < argc; i++) {
+        pid_t process_id = fork();
+        if (process_id == -1) {
+            perror("Fork failed");
+            exit(EXIT_FAILURE);
+        } else if (process_id == 0) { // Child process
+            capture_directory_snapshot(argv[i], NULL, argv[1]);
+            exit(EXIT_SUCCESS);
+        }
+    }
 
-
-    while (wait(NULL) > 0);
+    int exit_status;
+    pid_t child_pid;
+    while ((child_pid = wait(&exit_status)) > 0) {
+        printf("Child process with PID %d finished with code %d.\n", child_pid, WEXITSTATUS(exit_status));
+    }
 
     return 0;
 }
