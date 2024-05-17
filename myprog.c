@@ -20,20 +20,60 @@ struct FileDetails {
     mode_t file_permissions;
 };
 
-void capture_directory_snapshot(const char *directory_path, struct FileDetails *previous_snapshot, const char *quarantine_directory) {
+void read_existing_snapshot(const char *snapshot_path, struct FileDetails *snapshot, int *count) {
+    FILE *file = fopen(snapshot_path, "r");
+    if (file == NULL) {
+        *count = 0;
+        return;
+    }
+
+    *count = 0;
+    while (fscanf(file, "%s %ld %lld %o", snapshot[*count].name, &snapshot[*count].modified_time, &snapshot[*count].file_size, &snapshot[*count].file_permissions) == 4) {
+        (*count)++;
+    }
+
+    fclose(file);
+}
+
+bool is_snapshot_same(struct FileDetails *old_snapshot, int old_count, struct FileDetails *new_snapshot, int new_count) {
+    if (old_count != new_count) {
+        return false;
+    }
+
+    for (int i = 0; i < old_count; i++) {
+        if (strcmp(old_snapshot[i].name, new_snapshot[i].name) != 0 ||
+            old_snapshot[i].modified_time != new_snapshot[i].modified_time ||
+            old_snapshot[i].file_size != new_snapshot[i].file_size ||
+            old_snapshot[i].file_permissions != new_snapshot[i].file_permissions) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void write_snapshot(const char *snapshot_path, struct FileDetails *snapshot, int count) {
+    FILE *file = fopen(snapshot_path, "w");
+    if (file == NULL) {
+        perror("Error opening snapshot file for writing");
+        exit(EXIT_FAILURE);
+    }
+
+    for (int i = 0; i < count; i++) {
+        fprintf(file, "%s %ld %lld %o\n", snapshot[i].name, snapshot[i].modified_time, snapshot[i].file_size, snapshot[i].file_permissions);
+    }
+
+    fclose(file);
+}
+
+void capture_directory_snapshot(const char *directory_path, struct FileDetails *previous_snapshot, int previous_count, const char *quarantine_directory) {
     printf("Capturing snapshot for directory: %s\n", directory_path);
 
     char snapshot_file_path[MAX_PATH_LENGTH];
     snprintf(snapshot_file_path, MAX_PATH_LENGTH, "%s/DirectorySnapshot.txt", directory_path);
 
-    int snapshot_file = open(snapshot_file_path, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
-    if (snapshot_file == -1) {
-        perror("Error opening snapshot file");
-        exit(EXIT_FAILURE);
-    }
-
-    dprintf(snapshot_file, "Directory snapshot: %s\n", directory_path);
-    dprintf(snapshot_file, "---------------------------------\n");
+    struct FileDetails new_snapshot[MAX_FILES];
+    int new_count = 0;
 
     DIR *directory;
     struct dirent *file;
@@ -43,9 +83,7 @@ void capture_directory_snapshot(const char *directory_path, struct FileDetails *
         exit(EXIT_FAILURE);
     }
 
-    int file_count = 0;
-
-    while ((file = readdir(directory)) != NULL && file_count < MAX_FILES) {
+    while ((file = readdir(directory)) != NULL && new_count < MAX_FILES) {
         if (strcmp(file->d_name, ".") != 0 && strcmp(file->d_name, "..") != 0) {
             struct stat file_status;
             char file_path[MAX_PATH_LENGTH];
@@ -56,7 +94,7 @@ void capture_directory_snapshot(const char *directory_path, struct FileDetails *
                 exit(EXIT_FAILURE);
             }
 
-            if(strcmp(file->d_name, "DirectorySnapshot.txt") == 0) continue;
+            if (strcmp(file->d_name, "DirectorySnapshot.txt") == 0) continue;
             struct FileDetails file_metadata;
             strcpy(file_metadata.name, file->d_name);
             file_metadata.modified_time = file_status.st_mtime;
@@ -89,28 +127,26 @@ void capture_directory_snapshot(const char *directory_path, struct FileDetails *
 
                 file_metadata.file_permissions = strtol(permissions_str, NULL, 8);
 
-                if(file_metadata.file_permissions == 0){
+                if (file_metadata.file_permissions == 0) {
                     char quarantine_path[MAX_PATH_LENGTH];
                     snprintf(quarantine_path, MAX_PATH_LENGTH, "%s/%s", quarantine_directory, file->d_name);
                     rename(file_path, quarantine_path);
                 }
 
-                file_count++;
-                dprintf(snapshot_file, "File: %s\n", file_metadata.name);
-                dprintf(snapshot_file, "Size: %lld bytes\n", (long long)file_metadata.file_size);
-                dprintf(snapshot_file, "Permissions: %o\n", file_metadata.file_permissions);
-                dprintf(snapshot_file, "Last Modified: %s", ctime(&file_metadata.modified_time));
-                dprintf(snapshot_file, "\n");
+                new_snapshot[new_count++] = file_metadata;
 
                 if (S_ISDIR(file_status.st_mode)) {
-                    capture_directory_snapshot(file_path, previous_snapshot, quarantine_directory);
+                    capture_directory_snapshot(file_path, previous_snapshot, previous_count, quarantine_directory);
                 }
             }
         }
     }
 
     closedir(directory);
-    close(snapshot_file);
+
+    if (!is_snapshot_same(previous_snapshot, previous_count, new_snapshot, new_count)) {
+        write_snapshot(snapshot_file_path, new_snapshot, new_count);
+    }
 }
 
 int main(int argc, char *argv[]) {
@@ -125,7 +161,15 @@ int main(int argc, char *argv[]) {
             perror("Fork failed");
             exit(EXIT_FAILURE);
         } else if (process_id == 0) { // Child process
-            capture_directory_snapshot(argv[i], NULL, argv[1]);
+            struct FileDetails old_snapshot[MAX_FILES];
+            int old_count;
+
+            char snapshot_file_path[MAX_PATH_LENGTH];
+            snprintf(snapshot_file_path, MAX_PATH_LENGTH, "%s/DirectorySnapshot.txt", argv[i]);
+
+            read_existing_snapshot(snapshot_file_path, old_snapshot, &old_count);
+            capture_directory_snapshot(argv[i], old_snapshot, old_count, argv[1]);
+
             exit(EXIT_SUCCESS);
         }
     }
