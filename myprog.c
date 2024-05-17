@@ -1,14 +1,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdbool.h>
-#include <sys/wait.h>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <time.h>
+#include <stdbool.h>
+#include <sys/wait.h>
+
 #define MAX_PATH_LENGTH 4096
 #define MAX_FILES 100
 
@@ -62,44 +63,48 @@ void capture_directory_snapshot(const char *directory_path, struct FileDetails *
             file_metadata.file_size = file_status.st_size;
 
             int pipe_fd[2];
-            pipe(pipe_fd);
+            if (pipe(pipe_fd) == -1) {
+                perror("Pipe failed");
+                exit(EXIT_FAILURE);
+            }
+
             pid_t child_pid = fork();
-            if(child_pid == -1) {
+            if (child_pid == -1) {
                 perror("Fork failed");
                 exit(EXIT_FAILURE);
-            } else if(child_pid == 0) {
+            } else if (child_pid == 0) { // Child process
+                close(pipe_fd[0]); // Close unused read end
+                dup2(pipe_fd[1], STDOUT_FILENO); // Redirect stdout to pipe
+                close(pipe_fd[1]);
+
+                execl("./check_permissions.sh", "./check_permissions.sh", file_path, (char *)NULL);
+                perror("execl failed");
+                exit(EXIT_FAILURE);
+            } else { // Parent process
+                close(pipe_fd[1]); // Close unused write end
+
+                char permissions_str[4];
+                read(pipe_fd[0], permissions_str, sizeof(permissions_str));
                 close(pipe_fd[0]);
-                if((S_ISREG(file_status.st_mode) || S_ISDIR(file_status.st_mode)) && stat(file_path, &file_status) != -1 && ((file_status.st_mode & S_IRUSR) || (file_status.st_mode & S_IWUSR) || (file_status.st_mode & S_IXUSR))){
-                    file_metadata.file_permissions = file_status.st_mode;
-                } else {
-                    file_metadata.file_permissions = 0;
+
+                file_metadata.file_permissions = strtol(permissions_str, NULL, 8);
+
+                if(file_metadata.file_permissions == 0){
+                    char quarantine_path[MAX_PATH_LENGTH];
+                    snprintf(quarantine_path, MAX_PATH_LENGTH, "%s/%s", quarantine_directory, file->d_name);
+                    rename(file_path, quarantine_path);
                 }
-                write(pipe_fd[1], &file_metadata.file_permissions, sizeof(mode_t));
-                close(pipe_fd[1]);
-                exit(EXIT_SUCCESS);
-            } else {
-                close(pipe_fd[1]);
-                mode_t child_file_permissions;
-                read(pipe_fd[0], &child_file_permissions, sizeof(mode_t));
-                file_metadata.file_permissions = child_file_permissions;
-                close(pipe_fd[0]);
-            }
 
-            if(file_metadata.file_permissions == 0){
-                char quarantine_path[MAX_PATH_LENGTH];
-                snprintf(quarantine_path, MAX_PATH_LENGTH, "%s/%s", quarantine_directory, file->d_name);
-                rename(file_path, quarantine_path);
-            }
+                file_count++;
+                dprintf(snapshot_file, "File: %s\n", file_metadata.name);
+                dprintf(snapshot_file, "Size: %lld bytes\n", (long long)file_metadata.file_size);
+                dprintf(snapshot_file, "Permissions: %o\n", file_metadata.file_permissions);
+                dprintf(snapshot_file, "Last Modified: %s", ctime(&file_metadata.modified_time));
+                dprintf(snapshot_file, "\n");
 
-            file_count++;
-            dprintf(snapshot_file, "File: %s\n", file_metadata.name);
-            dprintf(snapshot_file, "Size: %lld bytes\n", (long long)file_metadata.file_size);
-            dprintf(snapshot_file, "Permissions: %o\n", file_metadata.file_permissions);
-            dprintf(snapshot_file, "Last Modified: %s", ctime(&file_metadata.modified_time));
-            dprintf(snapshot_file, "\n");
-
-            if (S_ISDIR(file_status.st_mode)) {
-                capture_directory_snapshot(file_path, previous_snapshot, quarantine_directory);
+                if (S_ISDIR(file_status.st_mode)) {
+                    capture_directory_snapshot(file_path, previous_snapshot, quarantine_directory);
+                }
             }
         }
     }
